@@ -24,11 +24,14 @@
 from typing import List, Optional, Tuple
 
 import numpy as np
+import json
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from torch import nn
+from copy import deepcopy
 from transformers import MixtralConfig
 
 from vllm.model_executor.input_metadata import InputMetadata
@@ -93,12 +96,46 @@ class MixtralMLP(nn.Module):
         return current_hidden_states
 
 
+def all_gather_dict(local_dict):
+    dist.barrier()
+
+    # Convert the local_dict to a list of tuples for all_gather_object
+    local_list = list(local_dict.items())
+
+    # All gather the list of tuples
+    gathered_list = [None for _ in range(dist.get_world_size())]
+    torch.distributed.all_gather_object(gathered_list, local_list)
+
+    # Convert the gathered list of tuples back to a dictionary
+    def tuple2dict(tuple_items):
+        out_dict = {}
+        for (key, val) in tuple_items:
+            out_dict[key] = val
+        return out_dict
+    gathered_dict = tuple2dict(deepcopy(gathered_list[0]))
+    for i, tuple_items in enumerate(gathered_list):
+        if i==0:
+            continue
+        temp_dict = tuple2dict(tuple_items)
+        # gathered_dict.update(temp_dict)
+        for key in gathered_dict.keys():
+            gathered_dict[key].update(temp_dict[key])
+
+    # Ensure that the gathered dictionary has the same structure on all processes
+    dist.barrier()
+    return gathered_dict
+
+
 class MixtralMoE(nn.Module):
+    # for tracking the global id of this layer
+    layer_count = 0
+    all_layer_expert_inputs_info = {}
 
     def __init__(
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
+        return_profile: bool = True,
     ):
         super().__init__()
         self.config = config
@@ -129,6 +166,13 @@ class MixtralMoE(nn.Module):
                                      self.num_total_experts,
                                      bias=False,
                                      linear_method=None)
+        self.return_profile = return_profile
+        if return_profile:
+            # from get_id import twonn_pytorch
+            self.expert_inputs_info = {}
+            self.layer_id = self.__class__.layer_count
+            self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
+            self.__class__.layer_count += 1
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -142,10 +186,31 @@ class MixtralMoE(nn.Module):
                                                        dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-        final_hidden_states = None
+        final_hidden_states = torch.zeros_like(hidden_states)
         for expert_idx in self.expert_indicies:
             expert_layer = self.experts[expert_idx]
-            expert_mask = (selected_experts == expert_idx)
+            # # 正常情况
+            # expert_mask = (selected_experts == expert_idx)
+            # 长尾情况
+            if self.rank == 0:
+                expert_mask = torch.ones_like(selected_experts).bool()
+            else:
+                expert_mask = torch.zeros_like(selected_experts).bool()
+            # # uniform情况
+            # expert_mask = torch.zeros_like(selected_experts)
+            # expert_mask[:, 0] = 1
+            # expert_mask = expert_mask.bool()
+
+            if self.return_profile:
+                # profile token distributions
+                num_tokens = expert_mask.sum().item()
+                # 更新当前专家历史输入信息
+                if expert_idx not in self.expert_inputs_info:
+                    self.expert_inputs_info[expert_idx] = []
+                self.expert_inputs_info[expert_idx].append(num_tokens)
+
+            if expert_mask.sum() == 0:
+                continue
             expert_weights = (routing_weights * expert_mask).sum(dim=-1,
                                                                  keepdim=True)
 
@@ -155,6 +220,16 @@ class MixtralMoE(nn.Module):
                 final_hidden_states = current_hidden_states
             else:
                 final_hidden_states.add_(current_hidden_states)
+
+        if self.return_profile:
+            assert self.layer_id in self.__class__.all_layer_expert_inputs_info
+            self.__class__.all_layer_expert_inputs_info[self.layer_id].update(self.expert_inputs_info)
+            # 如果是最后一层，则计算所有层的专家输入统计信息
+            if self.layer_id == self.__class__.layer_count - 1:
+                gathered_dict = all_gather_dict(deepcopy(self.__class__.all_layer_expert_inputs_info))
+                # 将统计信息保存为 JSON 文件和 CSV 文件
+                with open(f"expert_input_statistics.json", 'w') as f:
+                    json.dump(gathered_dict, f, indent=4)
 
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             batch_size, sequence_length, hidden_dim)
