@@ -174,7 +174,7 @@ class MixtralMoE(nn.Module):
             self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
             self.__class__.layer_count += 1
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_origin(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
@@ -189,17 +189,7 @@ class MixtralMoE(nn.Module):
         final_hidden_states = torch.zeros_like(hidden_states)
         for expert_idx in self.expert_indicies:
             expert_layer = self.experts[expert_idx]
-            # # 正常情况
-            # expert_mask = (selected_experts == expert_idx)
-            # 长尾情况
-            if self.rank == 0:
-                expert_mask = torch.ones_like(selected_experts).bool()
-            else:
-                expert_mask = torch.zeros_like(selected_experts).bool()
-            # # uniform情况
-            # expert_mask = torch.zeros_like(selected_experts)
-            # expert_mask[:, 0] = 1
-            # expert_mask = expert_mask.bool()
+            expert_mask = (selected_experts == expert_idx)
 
             if self.return_profile:
                 # profile token distributions
@@ -230,6 +220,84 @@ class MixtralMoE(nn.Module):
                 # 将统计信息保存为 JSON 文件和 CSV 文件
                 with open(f"expert_input_statistics.json", 'w') as f:
                     json.dump(gathered_dict, f, indent=4)
+
+        return tensor_model_parallel_all_reduce(final_hidden_states).view(
+            batch_size, sequence_length, hidden_dim)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # 计算路由权重
+        router_logits, _ = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+
+        # 选择 TOP-K 专家
+        top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        ep_size = len(self.expert_indicies)
+        world_size = dist.get_world_size()
+        num_tokens_all = len(hidden_states) * 2
+        num_tokens_per_ep_group = num_tokens_all // world_size
+        for local_idx, expert_idx in enumerate(self.expert_indicies):
+            expert_layer = self.experts[expert_idx]
+
+            #########################################
+            #  method 1: selectedd_experts
+            #########################################
+
+            # # Long-tailed
+            # selected_experts = torch.zeros_like(selected_experts) # (b,top_k)
+            # selected_experts[:, 0] = 1
+
+            # # uniform情况
+            # interval_per_expert = len(selected_experts) * 2 // (dist.get_world_size() * len(self.expert_indicies))
+            # selected_experts = torch.zeros_like(selected_experts)
+            # selected_experts -= 1
+            # selected_experts[:interval_per_expert, 0] *= (-1 * expert_idx)
+
+            # expert_mask = (selected_experts == expert_idx)
+
+
+            #########################################
+            #  method 2: expert_mask
+            #########################################
+            # # 正常情况
+            # expert_mask = (selected_experts == expert_idx)
+            
+            # 长尾情况
+            expert_mask = torch.zeros_like(selected_experts).bool()
+            if ep_size == 1:
+                if self.rank in [0, 1]:
+                    expert_mask[:, 0] = True
+            else:
+                if self.rank == 0 and local_idx < self.top_k:
+                    expert_mask[:, 0] = True
+
+            # # uniform情况
+            # expert_mask = torch.zeros_like(selected_experts)
+            # if ep_size == 1:
+            #     expert_mask[:num_tokens_per_ep_group, 0] = 1
+            # else:
+            #     if local_idx == 0:
+            #         expert_mask[:num_tokens_per_ep_group, 0] = 1
+            # expert_mask = expert_mask.bool()
+
+            # 创建专家掩码并进行选择
+            indices = torch.nonzero(expert_mask)
+
+            # 仅对选中的 hidden_states 进行计算
+            if indices.numel() > 0:
+                cur_weight = top_k_weights[indices[:, 0], indices[:, 1]].view(-1,1)
+                token_mask = expert_mask.sum(-1).bool().view(-1,1)
+                selected_hidden_states = torch.masked_select(hidden_states, token_mask).view(-1, hidden_dim)
+                current_hidden_states = expert_layer(selected_hidden_states)
+
+                # 应用权重并累加结果
+                current_hidden_states.mul_(cur_weight)
+                final_hidden_states.index_add_(0, indices[:, 0], current_hidden_states)
 
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             batch_size, sequence_length, hidden_dim)

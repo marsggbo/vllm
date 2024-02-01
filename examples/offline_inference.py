@@ -13,7 +13,7 @@ def load_json(file):
     return data
 
 alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
-num_samples = 400
+num_samples = 20
 data = []
 for i in range(num_samples):
     data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -41,8 +41,8 @@ llm = LLM(model=models[0], tensor_parallel_size=2, enforce_eager=True) # mistral
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 all_time = 0.
-prompts = data # one by one inference
-prompts = [data] # batch continuous inference/
+# prompts = data # one by one inference
+prompts = [data] # batch continuous inference
 for idx, prompt in enumerate(prompts):
     start = time.perf_counter()
     outputs = llm.generate(prompt, sampling_params)
@@ -51,10 +51,10 @@ for idx, prompt in enumerate(prompts):
     all_time += cost_iter
     print(f"{idx} seq ====> Time elapsed: {cost_iter} seconds")
     # Print the outputs.
-    # for output in outputs:
-    #     prompt = output.prompt
-    #     generated_text = output.outputs[0].text
-    #     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    for output in outputs[-3:]:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 print(f"Total time elapsed: {all_time} seconds")
 
 
