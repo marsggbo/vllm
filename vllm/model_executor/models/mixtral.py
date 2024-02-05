@@ -264,17 +264,17 @@ class MixtralMoE(nn.Module):
             #########################################
             #  method 2: expert_mask
             #########################################
-            # # 正常情况
-            # expert_mask = (selected_experts == expert_idx)
+            # 正常情况
+            expert_mask = (selected_experts == expert_idx)
             
-            # 长尾情况
-            expert_mask = torch.zeros_like(selected_experts).bool()
-            if ep_size == 1:
-                if self.rank in [0, 1]:
-                    expert_mask[:, 0] = True
-            else:
-                if self.rank == 0 and local_idx < self.top_k:
-                    expert_mask[:, 0] = True
+            # # 长尾情况
+            # expert_mask = torch.zeros_like(selected_experts).bool()
+            # if ep_size == 1:
+            #     if self.rank in [0, 1]:
+            #         expert_mask[:, 0] = True
+            # else:
+            #     if self.rank == 0 and local_idx < self.top_k:
+            #         expert_mask[:, 0] = True
 
             # # uniform情况
             # expert_mask = torch.zeros_like(selected_experts)
@@ -464,6 +464,8 @@ class MixtralModel(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
+        rank = get_tensor_model_parallel_rank()
+        # print(f"rank{rank}: [{input_ids.size(0)}, {input_ids.size(1)}],")
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):

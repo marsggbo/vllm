@@ -1,9 +1,30 @@
 from vllm import LLM, SamplingParams
 import time
 import json
+import torch
+import numpy as np
+import random
+
+def set_seed(seed):
+    # 设置PyTorch的随机数种子
+    torch.manual_seed(seed)
+
+    # 设置CUDA的随机数种子（如果使用GPU）
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # 设置Python内置的随机数种子
+    random.seed(seed)
+
+    # 设置NumPy的随机数种子
+    np.random.seed(seed)
+
+set_seed(666)
 models = [
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "facebook/opt-125m"
+    "facebook/opt-125m",
+    "/home/wangyuxin/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/"
 ]
 
 
@@ -12,8 +33,8 @@ def load_json(file):
         data = json.load(f)
     return data
 
-alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
-num_samples = 20
+alpaca_data = load_json("/home/wangyuxin/xinhe/Sequence-Scheduling/data/alpaca-train-10k.json")
+num_samples = 800
 data = []
 for i in range(num_samples):
     data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -33,29 +54,41 @@ for i in range(num_samples):
 #     """Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nGenerate a creative birthday wish for a friend.\n\n### Response:"""
 # ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_k=50)
+sampling_params = SamplingParams(temperature=0.8, top_k=50, max_tokens=1) # max_tokens=1 disables decoding
 
 # Create an LLM.
 # llm = LLM(model=models[1], load_format='dummy', tensor_parallel_size=2) # test
-llm = LLM(model=models[0], tensor_parallel_size=2, enforce_eager=True) # mistral
+llm = LLM(model=models[-1], tensor_parallel_size=8, enforce_eager=True, seed=666) # mistral
+balance_prefilling = False
+if balance_prefilling:
+    tokenizer = llm.get_tokenizer()
+    num_tokens = []
+    for sample in data:
+        num_tokens.append(len(tokenizer.encode(sample)))
+    sorted_indices = sorted(range(len(num_tokens)), key=lambda idx: num_tokens[idx])
+    num_tokens = [num_tokens[idx] for idx in sorted_indices]
+    data = [data[idx] for idx in sorted_indices]
+
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
-all_time = 0.
+all_time = []
 # prompts = data # one by one inference
-prompts = [data] # batch continuous inference
+prompts = [data] * 10 # batch continuous inference
 for idx, prompt in enumerate(prompts):
     start = time.perf_counter()
     outputs = llm.generate(prompt, sampling_params)
     end = time.perf_counter()
     cost_iter = end - start
-    all_time += cost_iter
-    print(f"{idx} seq ====> Time elapsed: {cost_iter} seconds")
+    all_time.append(cost_iter)
+    # print(f"{idx} seq ====> Time elapsed: {cost_iter} seconds")
     # Print the outputs.
-    for output in outputs[-3:]:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
-print(f"Total time elapsed: {all_time} seconds")
+    # for output in outputs[-3:]:
+    #     prompt = output.prompt
+    #     generated_text = output.outputs[0].text
+    #     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+avg = np.mean(all_time)
+std = np.std(all_time)
+print(f"Total time elapsed: {avg:.4f}±{std:.4f} seconds")
 
 
 # CUDA_VISIBLE_DEVICES=2,3 python examples/offline_inference.py # 实测可运行，但是更长的句子还未测试 
