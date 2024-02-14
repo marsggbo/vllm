@@ -108,6 +108,7 @@ class RequestOutput:
                                       seq.get_output_token_ids(),
                                       seq.get_cumulative_logprob(), logprobs,
                                       finshed_reason)
+            output.seq_group = seq_group
             outputs.append(output)
 
         # Every sequence in the sequence group should have the same prompt.

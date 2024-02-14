@@ -807,6 +807,17 @@ class LLMEngine:
         else:
             output = []
 
+        # tracing expert choices for each token of different sentences
+        if os.environ.get("EXPERT_TRACE", "0") == "1":
+            for i in range(len(output)):
+                seq_group = scheduler_outputs.scheduled_seq_groups[i]
+                num_tokens = seq_group.get_seqs()[0].get_len()
+                if not hasattr(seq_group, 'token2experts'):
+                    seq_group.token2experts = {idx: output[i].token2experts[idx] for idx in range(num_tokens)}
+                else:
+                    for token_id in output[i].token2experts:
+                        start_idx = len(seq_group.token2experts)
+                        seq_group.token2experts[start_idx + token_id] = output[i].token2experts[token_id]
         return self._process_model_outputs(output, scheduler_outputs)
 
     def do_log_stats(self) -> None:

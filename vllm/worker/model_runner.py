@@ -1,6 +1,7 @@
 import time
 from typing import Dict, List, Optional, Tuple, Set, Union
 
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -531,6 +532,21 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
+
+        # tracing expert choices for each token
+        if os.environ.get("EXPERT_TRACE", "0") == "1":
+            token2experts = dict()
+            for seq_idx in range(input_tokens.size(0)):
+                token2experts[seq_idx] = dict()
+                if input_tokens.size(1) == 1:
+                    num_tokens = 1
+                else:
+                    num_tokens = max(input_positions[seq_idx]) + 1
+                for token_idx in range(num_tokens):
+                    token2experts[seq_idx][token_idx] = dict()
+            for i in range(len(model_executable.model.layers)):
+                moe_layer = model_executable.model.layers[i].block_sparse_moe
+                moe_layer.token2experts = token2experts
         hidden_states = model_executable(
             input_ids=input_tokens,
             positions=input_positions,
@@ -543,6 +559,10 @@ class ModelRunner:
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
         )
+        # tracing expert choices for each token
+        if os.environ.get("EXPERT_TRACE", "0") == "1":
+            for i in range(len(output)):
+                output[i].token2experts = token2experts[i]
         return output
 
     @torch.inference_mode()

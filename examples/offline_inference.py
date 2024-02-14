@@ -1,5 +1,6 @@
 from vllm import LLM, SamplingParams
 import time
+import os
 import json
 import torch
 import numpy as np
@@ -34,7 +35,7 @@ def load_json(file):
     return data
 
 alpaca_data = load_json("/home/wangyuxin/xinhe/Sequence-Scheduling/data/alpaca-train-10k.json")
-num_samples = 800
+num_samples = 3
 data = []
 for i in range(num_samples):
     data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -54,12 +55,14 @@ for i in range(num_samples):
 #     """Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nGenerate a creative birthday wish for a friend.\n\n### Response:"""
 # ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_k=50, max_tokens=1) # max_tokens=1 disables decoding
+sampling_params = SamplingParams(temperature=0.8, top_k=50,
+                                 max_tokens=5
+                                 ) # max_tokens=1 disables decoding
 
 # Create an LLM.
 # llm = LLM(model=models[1], load_format='dummy', tensor_parallel_size=2) # test
-llm = LLM(model=models[-1], tensor_parallel_size=8, enforce_eager=True, seed=666) # mistral
-balance_prefilling = False
+llm = LLM(model=models[-1], tensor_parallel_size=2, enforce_eager=True, seed=666) # mistral
+balance_prefilling = True
 if balance_prefilling:
     tokenizer = llm.get_tokenizer()
     num_tokens = []
@@ -73,13 +76,15 @@ if balance_prefilling:
 # that contain the prompt, generated text, and other information.
 all_time = []
 # prompts = data # one by one inference
-prompts = [data] * 10 # batch continuous inference
+prompts = [data] * 1 # batch continuous inference
 for idx, prompt in enumerate(prompts):
     start = time.perf_counter()
     outputs = llm.generate(prompt, sampling_params)
     end = time.perf_counter()
     cost_iter = end - start
     all_time.append(cost_iter)
+    if os.environ.get("EXPERT_TRACE", "0") == "1":
+        print(outputs[1].outputs[0].seq_group.token2experts, outputs[1].outputs[0].seq_group.get_seqs()[0].get_len())
     # print(f"{idx} seq ====> Time elapsed: {cost_iter} seconds")
     # Print the outputs.
     # for output in outputs[-3:]:
