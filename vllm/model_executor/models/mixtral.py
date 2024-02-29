@@ -136,7 +136,7 @@ class MixtralMoE(nn.Module):
         self,
         config: MixtralConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        return_profile: bool = True,
+        return_profile: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -168,12 +168,10 @@ class MixtralMoE(nn.Module):
                                      bias=False,
                                      linear_method=None)
         self.return_profile = return_profile
-        if return_profile:
-            # from get_id import twonn_pytorch
-            self.expert_inputs_info = {}
-            self.layer_id = self.__class__.layer_count
-            self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
-            self.__class__.layer_count += 1
+        self.layer_id = self.__class__.layer_count
+        self.__class__.layer_count += 1
+        self.expert_inputs_info = {}
+        self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
 
     def forward_origin(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -501,10 +499,10 @@ class MixtralModel(nn.Module):
                                             residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         moe_layer = self.layers[-1].block_sparse_moe
-        for layer_id, layer_info in moe_layer.gathered_dict.items():
-            for expert_id, expert_info in layer_info.items():
-                print(f"layer{layer_id} exeprt{expert_id}: {expert_info[1:]}")
-        print('\n======\n')
+        # for layer_id, layer_info in moe_layer.gathered_dict.items():
+        #     for expert_id, expert_info in layer_info.items():
+        #         print(f"layer{layer_id} exeprt{expert_id}: {expert_info[1:]}")
+        # print('\n======\n')
         return hidden_states
 
 

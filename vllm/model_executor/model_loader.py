@@ -73,14 +73,14 @@ def get_model(model_config: ModelConfig,
                     "be added in the future. If this is important to you, "
                     "please open an issue on github.")
             else:
-                if model_config.hf_config.architectures[0]=="MixtralForCausalLM":
-                    model_config.hf_config.hidden_size=1024
-                    model_config.hf_config.intermediate_size=1024
-                    model_config.hf_config.num_attention_heads=8
-                    model_config.hf_config.num_hidden_layers=4
-                    model_config.hf_config.num_local_experts=8
-                    model_config.hf_config.output_router_logits=True
-                    model_config.load_format = 'dummy'
+                # if model_config.hf_config.architectures[0]=="MixtralForCausalLM":
+                #     model_config.hf_config.hidden_size=1024
+                #     model_config.hf_config.intermediate_size=1024
+                #     model_config.hf_config.num_attention_heads=8
+                #     model_config.hf_config.num_hidden_layers=4
+                #     model_config.hf_config.num_local_experts=8
+                #     model_config.hf_config.output_router_logits=True
+                #     model_config.load_format = 'dummy'
                 model = model_class(model_config.hf_config, linear_method)
                 params = sum([p.numel() for p in model.parameters()])
                 print(f"{model_class} #params: {params}")

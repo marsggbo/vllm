@@ -543,7 +543,7 @@ class ModelRunner:
                 else:
                     num_tokens = max(input_positions[seq_idx]) + 1
                 for token_idx in range(num_tokens):
-                    token2experts[seq_idx][token_idx] = dict()
+                    token2experts[seq_idx][token_idx] = {'token_idx': input_tokens[seq_idx, token_idx].item()}
             for i in range(len(model_executable.model.layers)):
                 moe_layer = model_executable.model.layers[i].block_sparse_moe
                 moe_layer.token2experts = token2experts
@@ -560,7 +560,7 @@ class ModelRunner:
             sampling_metadata=sampling_metadata,
         )
         # tracing expert choices for each token
-        if os.environ.get("EXPERT_TRACE", "0") == "1":
+        if os.environ.get("EXPERT_TRACE", "0") == "1" and output is not None:
             for i in range(len(output)):
                 output[i].token2experts = token2experts[i]
         return output
