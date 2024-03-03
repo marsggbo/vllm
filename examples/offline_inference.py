@@ -26,7 +26,8 @@ models = [
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "facebook/opt-125m",
     "/home/wangyuxin/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/",
-    "/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/125c431e2ff41a156b9f9076f744d2f35dd6e67a/"
+    "/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/125c431e2ff41a156b9f9076f744d2f35dd6e67a/",
+    # 'deepseek-ai/deepseek-moe-16b-base'
 ]
 
 
@@ -37,18 +38,30 @@ def load_json(file):
 
 # alpaca_data
 alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
-num_samples = 800
+num_samples = 10000
 data = []
 for i in range(num_samples):
     data.append(alpaca_data[i]['conversations'][0]['value'])
+
+# # yizhongw/self_instruct
+# from datasets import load_dataset
+# dataset = load_dataset("yizhongw/self_instruct", "super_natural_instructions")
+# data_prompts = dataset['train']['prompt']
+# num_samples = 10000
+# data = []
+# for i in range(num_samples):
+#     data.append(data_prompts[i])
+
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=1, top_k=100,
-                                #  max_tokens=500000
+sampling_params = SamplingParams(temperature=0.8, top_k=100,
+                                 max_tokens=1024
                                  ) # max_tokens=1 disables decoding
 
 # Create an LLM.
-llm = LLM(model=models[-1], tensor_parallel_size=2, enforce_eager=True, seed=666) # mistral
-balance_prefilling = False
+llm = LLM(model=models[-1], tensor_parallel_size=2, enforce_eager=True, seed=666
+        #   , trust_remote_code=True
+          ) # mistral
+balance_prefilling = True
 if balance_prefilling:
     tokenizer = llm.get_tokenizer()
     num_tokens = []
@@ -70,18 +83,13 @@ for idx, prompt in enumerate(prompts):
     cost_iter = end - start
     all_time.append(cost_iter)
     if os.environ.get("EXPERT_TRACE", "0") == "1":
-        for i in range(num_samples):
-            prompt_len = outputs[i].outputs[0].seq_group.get_seqs()[0].get_prompt_len()
-            output_len = outputs[i].outputs[0].seq_group.get_seqs()[0].get_output_len()
-            print(prompt_len, output_len, prompt_len+output_len)
-        # print(outputs[1].outputs[0].seq_group.token2experts, outputs[1].outputs[0].seq_group.get_seqs()[0].get_len())
-        torch.save(outputs, f"outputs_{idx}.pt")
+        torch.save(outputs, f"alpaca_{num_samples}.pt")
     print(f"{idx} seq ====> Time elapsed: {cost_iter} seconds")
     # Print the outputs.
-    # for output in outputs[-3:]:
-    #     prompt = output.prompt
-    #     generated_text = output.outputs[0].text
-    #     print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
+    for output in outputs[-2:]:
+        prompt = output.prompt
+        generated_text = output.outputs[0].text
+        print(f"Prompt: {prompt!r}, Generated text: {generated_text!r}")
 avg = np.mean(all_time)
 std = np.std(all_time)
 _all = np.sum(all_time)

@@ -65,16 +65,16 @@ class UniformTokenDistribution(Policy):
         now: float,
         seq_groups: Deque[SequenceGroup],
     ) -> Deque[SequenceGroup]:
-        expert_choice_list = []
-        if os.environ.get("EXPERT_TRACE", "0") == "1" and len(seq_groups) > 0:
-            for seq_group in seq_groups:
-                expert_choice = self.get_expert_choice(seq_group)
-                expert_choice_list.append(expert_choice)
-            expert_choice_list = torch.stack(expert_choice_list, dim=0) # (num_token, num_layer, num_experts)
-            similarities = self.compute_similarity(
-                expert_choice_list[:, None, :, :], expert_choice_list[None, :, :, :])
-            min_mean_max = lambda x: (x.min(), x.mean(), x.max())
-            print("similarities", min_mean_max(similarities))
+        # expert_choice_list = []
+        # if os.environ.get("EXPERT_TRACE", "0") == "1" and len(seq_groups) > 0:
+        #     for seq_group in seq_groups:
+        #         expert_choice = self.get_expert_choice(seq_group)
+        #         expert_choice_list.append(expert_choice)
+        #     expert_choice_list = torch.stack(expert_choice_list, dim=0) # (num_token, num_layer, num_experts)
+        #     similarities = self.compute_similarity(
+        #         expert_choice_list[:, None, :, :], expert_choice_list[None, :, :, :])
+        #     min_mean_max = lambda x: (x.min(), x.mean(), x.max())
+        #     print("similarities", min_mean_max(similarities))
         return deque(
             sorted(
                 seq_groups,

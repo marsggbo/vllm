@@ -544,8 +544,13 @@ class ModelRunner:
                     num_tokens = max(input_positions[seq_idx]) + 1
                 for token_idx in range(num_tokens):
                     token2experts[seq_idx][token_idx] = {'token_idx': input_tokens[seq_idx, token_idx].item()}
+            moe_name = 'block_sparse_moe'
+            if model_executable.model.__class__.__name__ == 'MixtralModel':
+                moe_name = 'block_sparse_moe'
+            elif model_executable.model.__class__.__name__ == 'DeepseekModel':
+                moe_name = 'mlp'                
             for i in range(len(model_executable.model.layers)):
-                moe_layer = model_executable.model.layers[i].block_sparse_moe
+                moe_layer = getattr(model_executable.model.layers[i], moe_name)
                 moe_layer.token2experts = token2experts
         hidden_states = model_executable(
             input_ids=input_tokens,

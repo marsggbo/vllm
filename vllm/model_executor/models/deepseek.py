@@ -2,7 +2,7 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2023 DeepSeek-AI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its
@@ -20,25 +20,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Mixtral model."""
-from typing import List, Optional, Tuple
+"""Inference-only Deepseek model."""
+from typing import Any, Dict, List, Optional, Tuple
 
 import os
 import numpy as np
-import json
-
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
-
 from torch import nn
-from copy import deepcopy
-from transformers import MixtralConfig
+from transformers import PretrainedConfig
 
 from vllm.model_executor.input_metadata import InputMetadata
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import PagedAttention
+# from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
+                                               MergedColumnParallelLinear,
                                                ReplicatedLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
@@ -58,180 +56,131 @@ from vllm.sequence import SamplerOutput
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
-class MixtralMLP(nn.Module):
+class DeepseekMLP(nn.Module):
 
     def __init__(
         self,
-        num_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        hidden_act: str,
         linear_method: Optional[LinearMethodBase] = None,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
-        self.num_experts = num_experts
-        self.ffn_dim = intermediate_size
-        self.hidden_dim = hidden_size
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size, [intermediate_size] * 2,
+            bias=False,
+            linear_method=linear_method)
+        self.down_proj = RowParallelLinear(intermediate_size,
+                                           hidden_size,
+                                           bias=False,
+                                           linear_method=linear_method,
+                                           reduce_results=reduce_results)
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. "
+                             "Only silu is supported for now.")
+        self.act_fn = SiluAndMul()
 
-        self.w1 = ReplicatedLinear(self.hidden_dim,
-                                   self.ffn_dim,
-                                   bias=False,
-                                   linear_method=linear_method)
-        self.w2 = ReplicatedLinear(self.ffn_dim,
-                                   self.hidden_dim,
-                                   bias=False,
-                                   linear_method=linear_method)
-        self.w3 = ReplicatedLinear(self.hidden_dim,
-                                   self.ffn_dim,
-                                   bias=False,
-                                   linear_method=linear_method)
-
-        # TODO: Use vllm's SiluAndMul
-        self.act_fn = nn.SiLU()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        w1_out, _ = self.w1(hidden_states)
-        w1_out = self.act_fn(w1_out)
-        w3_out, _ = self.w3(hidden_states)
-        current_hidden_states = w1_out * w3_out
-        current_hidden_states, _ = self.w2(current_hidden_states)
-        return current_hidden_states
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
-def all_gather_dict(local_dict):
-    dist.barrier()
-
-    # Convert the local_dict to a list of tuples for all_gather_object
-    local_list = list(local_dict.items())
-
-    # All gather the list of tuples
-    gathered_list = [None for _ in range(dist.get_world_size())]
-    torch.distributed.all_gather_object(gathered_list, local_list)
-
-    # Convert the gathered list of tuples back to a dictionary
-    def tuple2dict(tuple_items):
-        out_dict = {}
-        for (key, val) in tuple_items:
-            out_dict[key] = val
-        return out_dict
-    gathered_dict = tuple2dict(deepcopy(gathered_list[0]))
-    for i, tuple_items in enumerate(gathered_list):
-        if i==0:
-            continue
-        temp_dict = tuple2dict(tuple_items)
-        # gathered_dict.update(temp_dict)
-        for key in gathered_dict.keys():
-            gathered_dict[key].update(temp_dict[key])
-
-    # Ensure that the gathered dictionary has the same structure on all processes
-    dist.barrier()
-    return gathered_dict
-
-
-class MixtralMoE(nn.Module):
+class DeepseekMoE(nn.Module):
     # for tracking the global id of this layer
     layer_count = 0
     all_layer_expert_inputs_info = {}
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: PretrainedConfig,
         linear_method: Optional[LinearMethodBase] = None,
-        return_profile: bool = False,
     ):
         super().__init__()
         self.config = config
         self.rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.num_total_experts = config.num_local_experts
+        self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
-        if self.tp_size > self.num_total_experts:
+        if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {self.num_total_experts}.")
-        # Split experts equally between ranks
+                f"the number of experts {self.n_routed_experts}.")
+
         self.expert_indicies = np.array_split(range(
-            self.num_total_experts), self.tp_size)[self.rank].tolist()
+            self.n_routed_experts), self.tp_size)[self.rank].tolist()
         if not self.expert_indicies:
             raise ValueError(
                 f"Rank {self.rank} has no experts assigned to it.")
-
         self.experts = nn.ModuleList([
-            MixtralMLP(self.num_total_experts,
-                       config.hidden_size,
-                       config.intermediate_size,
-                       linear_method=linear_method)
+            DeepseekMLP(hidden_size=config.hidden_size,
+                        intermediate_size=config.moe_intermediate_size,
+                        hidden_act=config.hidden_act,
+                        linear_method=linear_method,
+                        reduce_results=False)
             if idx in self.expert_indicies else None
-            for idx in range(self.num_total_experts)
+            for idx in range(self.n_routed_experts)
         ])
+        # self.pack_params()
+
         self.gate = ReplicatedLinear(config.hidden_size,
-                                     self.num_total_experts,
+                                     self.n_routed_experts,
                                      bias=False,
                                      linear_method=None)
-        self.return_profile = return_profile
+
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                linear_method=linear_method,
+                reduce_results=False,
+            )
         self.layer_id = self.__class__.layer_count
         self.__class__.layer_count += 1
         self.expert_inputs_info = {}
         self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
 
-    def forward_origin(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+    def pack_params(self):
+        w1 = []
+        w2 = []
+        for expert in self.experts:
+            w1.append(expert.gate_up_proj.weight)
+            w2.append(expert.down_proj.weight)
+        self.w1 = torch._utils._flatten_dense_tensors(w1)
+        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
+        for data, param in zip(w1s, w1):
+            param.data = data
+        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights,
-                                                       self.top_k,
-                                                       dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        self.w2 = torch._utils._flatten_dense_tensors(w2)
+        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
+        for data, param in zip(w2s, w2):
+            param.data = data
 
-        final_hidden_states = torch.zeros_like(hidden_states)
-        for expert_idx in self.expert_indicies:
-            expert_layer = self.experts[expert_idx]
-            expert_mask = (selected_experts == expert_idx)
-
-            if self.return_profile:
-                # profile token distributions
-                num_tokens = expert_mask.sum().item()
-                # 更新当前专家历史输入信息
-                if expert_idx not in self.expert_inputs_info:
-                    self.expert_inputs_info[expert_idx] = []
-                self.expert_inputs_info[expert_idx].append(num_tokens)
-
-            if expert_mask.sum() == 0:
-                continue
-            expert_weights = (routing_weights * expert_mask).sum(dim=-1,
-                                                                 keepdim=True)
-
-            current_hidden_states = expert_layer(hidden_states).mul_(
-                expert_weights)
-            if final_hidden_states is None:
-                final_hidden_states = current_hidden_states
-            else:
-                final_hidden_states.add_(current_hidden_states)
-
-        if self.return_profile:
-            assert self.layer_id in self.__class__.all_layer_expert_inputs_info
-            self.__class__.all_layer_expert_inputs_info[self.layer_id].update(self.expert_inputs_info)
-            # 如果是最后一层，则计算所有层的专家输入统计信息
-            if self.layer_id == self.__class__.layer_count - 1:
-                gathered_dict = all_gather_dict(deepcopy(self.__class__.all_layer_expert_inputs_info))
-                # 将统计信息保存为 JSON 文件和 CSV 文件
-                with open(f"expert_input_statistics.json", 'w') as f:
-                    json.dump(gathered_dict, f, indent=4)
-
-        return tensor_model_parallel_all_reduce(final_hidden_states).view(
-            batch_size, sequence_length, hidden_dim)
+        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-
-        # 计算路由权重
+        if self.config.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (batch * sequence_length, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        # final_hidden_states = fused_moe(hidden_states,
+        #                                 self.w1,
+        #                                 self.w2,
+        #                                 router_logits,
+        #                                 self.top_k,
+        #                                 renormalize=self.config.norm_topk_prob,
+        #                                 inplace=True)
+
 
         # 选择 TOP-K 专家
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
@@ -247,61 +196,9 @@ class MixtralMoE(nn.Module):
                             self.token2experts[seq_idx][token_idx][self.layer_id] = []
                         self.token2experts[seq_idx][token_idx][self.layer_id].append(expert_indices)
         final_hidden_states = torch.zeros_like(hidden_states)
-        ep_size = len(self.expert_indicies)
-        world_size = dist.get_world_size()
-        num_tokens_all = len(hidden_states) * 2
-        num_tokens_per_ep_group = num_tokens_all // world_size
         for local_idx, expert_idx in enumerate(self.expert_indicies):
             expert_layer = self.experts[expert_idx]
-
-            #########################################
-            #  method 1: selectedd_experts
-            #########################################
-
-            # # Long-tailed
-            # selected_experts = torch.zeros_like(selected_experts) # (b,top_k)
-            # selected_experts[:, 0] = 1
-
-            # # uniform情况
-            # interval_per_expert = len(selected_experts) * 2 // (dist.get_world_size() * len(self.expert_indicies))
-            # selected_experts = torch.zeros_like(selected_experts)
-            # selected_experts -= 1
-            # selected_experts[:interval_per_expert, 0] *= (-1 * expert_idx)
-
-            # expert_mask = (selected_experts == expert_idx)
-
-
-            #########################################
-            #  method 2: expert_mask
-            #########################################
-            # 正常情况
             expert_mask = (selected_experts == expert_idx)
-            
-            # # 长尾情况
-            # expert_mask = torch.zeros_like(selected_experts).bool()
-            # if ep_size == 1:
-            #     if self.rank in [0, 1]:
-            #         expert_mask[:, 0] = True
-            # else:
-            #     if self.rank == 0 and local_idx < self.top_k:
-            #         expert_mask[:, 0] = True
-
-            # # uniform情况
-            # expert_mask = torch.zeros_like(selected_experts)
-            # if ep_size == 1:
-            #     expert_mask[:num_tokens_per_ep_group, 0] = 1
-            # else:
-            #     if local_idx == 0:
-            #         expert_mask[:num_tokens_per_ep_group, 0] = 1
-            # expert_mask = expert_mask.bool()
-
-            if self.return_profile:
-                # profile token distributions
-                num_tokens = expert_mask.sum().item()
-                # 更新当前专家历史输入信息
-                if expert_idx not in self.expert_inputs_info:
-                    self.expert_inputs_info[expert_idx] = []
-                self.expert_inputs_info[expert_idx].append(num_tokens)
             # 创建专家掩码并进行选择
             indices = torch.nonzero(expert_mask)
 
@@ -316,27 +213,27 @@ class MixtralMoE(nn.Module):
                 current_hidden_states.mul_(cur_weight)
                 final_hidden_states.index_add_(0, indices[:, 0], current_hidden_states)
 
-        if self.return_profile:
-            assert self.layer_id in self.__class__.all_layer_expert_inputs_info
-            self.__class__.all_layer_expert_inputs_info[self.layer_id].update(self.expert_inputs_info)
-            # 如果是最后一层，则计算所有层的专家输入统计信息
-            if self.layer_id == self.__class__.layer_count - 1:
-                gathered_dict = all_gather_dict(deepcopy(self.__class__.all_layer_expert_inputs_info))
-                self.__class__.gathered_dict = gathered_dict
-        return tensor_model_parallel_all_reduce(final_hidden_states).view(
-            batch_size, sequence_length, hidden_dim)
+        if self.config.n_shared_experts is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        final_hidden_states = tensor_model_parallel_all_reduce(
+            final_hidden_states)
+
+        return final_hidden_states.view(batch_size, sequence_length,
+                                        hidden_dim)
 
 
-class MixtralAttention(nn.Module):
+class DeepseekAttention(nn.Module):
 
-    def __init__(self,
-                 hidden_size: int,
-                 num_heads: int,
-                 num_kv_heads: int,
-                 max_position: int = 4096 * 32,
-                 rope_theta: float = 10000,
-                 linear_method: Optional[LinearMethodBase] = None,
-                 sliding_window: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        linear_method: Optional[LinearMethodBase] = None,
+    ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -358,7 +255,7 @@ class MixtralAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
-        self.sliding_window = sliding_window
+        self.max_position_embeddings = max_position_embeddings
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -368,26 +265,25 @@ class MixtralAttention(nn.Module):
             bias=False,
             linear_method=linear_method,
         )
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             linear_method=linear_method,
         )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=int(self.rope_theta),
-            is_neox_style=True,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            sliding_window=self.sliding_window,
-        )
+        self.attn = PagedAttention(self.num_heads,
+                                   self.head_dim,
+                                   self.scaling,
+                                   num_kv_heads=self.num_kv_heads)
 
     def forward(
         self,
@@ -405,27 +301,39 @@ class MixtralAttention(nn.Module):
         return output
 
 
-class MixtralDecoderLayer(nn.Module):
+class DeepseekDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: PretrainedConfig,
+        layer_idx: int,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        # Requires transformers > 4.32.0
         rope_theta = getattr(config, "rope_theta", 10000)
-        self.self_attn = MixtralAttention(
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
+        self.self_attn = DeepseekAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
-            sliding_window=config.sliding_window,
-            linear_method=linear_method)
-        self.block_sparse_moe = MixtralMoE(config=config,
-                                           linear_method=linear_method)
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            linear_method=linear_method,
+        )
+        if (config.n_routed_experts is not None and  \
+            layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0):
+            self.mlp = DeepseekMoE(config=config, linear_method=linear_method)
+        else:
+            self.mlp = DeepseekMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                linear_method=linear_method,
+            )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -456,15 +364,15 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
-class MixtralModel(nn.Module):
+class DeepseekModel(nn.Module):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: PretrainedConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
@@ -476,8 +384,10 @@ class MixtralModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList([
-            MixtralDecoderLayer(config, linear_method=linear_method)
-            for _ in range(config.num_hidden_layers)
+            DeepseekDecoderLayer(config,
+                                 layer_idx,
+                                 linear_method=linear_method)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -488,8 +398,6 @@ class MixtralModel(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        rank = get_tensor_model_parallel_rank()
-        # print(f"rank{rank}: [{input_ids.size(0)}, {input_ids.size(1)}],")
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for i in range(len(self.layers)):
@@ -498,25 +406,20 @@ class MixtralModel(nn.Module):
                                             kv_caches[i], input_metadata,
                                             residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        moe_layer = self.layers[-1].block_sparse_moe
-        # for layer_id, layer_info in moe_layer.gathered_dict.items():
-        #     for expert_id, expert_info in layer_info.items():
-        #         print(f"layer{layer_id} exeprt{expert_id}: {expert_info[1:]}")
-        # print('\n======\n')
         return hidden_states
 
 
-class MixtralForCausalLM(nn.Module):
+class DeepseekForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: MixtralConfig,
+        config: PretrainedConfig,
         linear_method: Optional[LinearMethodBase] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.linear_method = linear_method
-        self.model = MixtralModel(config, linear_method)
+        self.model = DeepseekModel(config, linear_method)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.sampler = Sampler(config.vocab_size)
 
@@ -550,6 +453,8 @@ class MixtralForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
@@ -568,6 +473,10 @@ class MixtralForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip experts that are not assigned to this worker.
+                if (("mlp.experts." in name or "mlp.shared_experts." in name)
+                        and name not in params_dict):
+                    continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -577,7 +486,7 @@ class MixtralForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Skip experts that are not assigned to this worker.
-                if ("block_sparse_moe.experts." in name
+                if (("mlp.experts." in name or "mlp.shared_experts." in name)
                         and name not in params_dict):
                     continue
                 param = params_dict[name]
