@@ -488,7 +488,7 @@ class MixtralModel(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        rank = get_tensor_model_parallel_rank()
+        # rank = get_tensor_model_parallel_rank()
         # print(f"rank{rank}: [{input_ids.size(0)}, {input_ids.size(1)}],")
         hidden_states = self.embed_tokens(input_ids)
         residual = None
@@ -498,7 +498,7 @@ class MixtralModel(nn.Module):
                                             kv_caches[i], input_metadata,
                                             residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        moe_layer = self.layers[-1].block_sparse_moe
+        # moe_layer = self.layers[-1].block_sparse_moe
         # for layer_id, layer_info in moe_layer.gathered_dict.items():
         #     for expert_id, expert_info in layer_info.items():
         #         print(f"layer{layer_id} exeprt{expert_id}: {expert_info[1:]}")
