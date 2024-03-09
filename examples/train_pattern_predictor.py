@@ -19,7 +19,7 @@ from transformers import (
     DataCollatorWithPadding,
     Trainer
 )
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
 
 from fastchat.train.train import (
     DataArguments,
@@ -35,6 +35,15 @@ NUM_LABELS = num_layers * num_experts_per_layer
 PADDING_SIDE = 'right'
 model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
 
+@dataclass
+class TokenClassificationLMOutputWithPast(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    labels: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    
 @dataclass
 class LoraArguments:
     lora_r: int = 8
@@ -162,13 +171,25 @@ def new_forward(
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return TokenClassificationLMOutputWithPast(
             loss=loss,
             logits=logits,
+            labels=labels,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+def compute_metrics(outputs):
+    true_labels = outputs.labels
+    pred_labels = outputs.logits
+    true_indices = torch.nonzero(true_labels)[:,-1].view(true_labels.size(0), -1, 2)
+    pred_indices = pred_labels.topk(2)[1].sort()[0]
+    mask = (pred_indices == true_indices)
+    acc = mask.sum() / true_indices.numel()
+    return {
+        'accuracy': acc
+    }
 
 
 def train():
@@ -188,12 +209,12 @@ def train():
     config = AutoConfig.from_pretrained(
         model_args.model_name_or_path
     )
-    # for debug
-    config.num_hidden_layers = 4
+    # # for debug
+    config.num_hidden_layers = 8
     config.hidden_size = 1024
     config.intermediate_size = 2048
     model = AutoModelForCausalLM.from_config(config)
-    # for real training
+    ## for real training
     # model = AutoModelForCausalLM.from_pretrained(
     #     "mistralai/Mistral-7B-Instruct-v0.2")
     model.forward = types.MethodType(new_forward, model)
@@ -249,7 +270,8 @@ def train():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
     )
     model.config.use_cache = False
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
