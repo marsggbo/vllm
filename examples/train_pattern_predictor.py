@@ -19,7 +19,7 @@ from transformers import (
     DataCollatorWithPadding,
     Trainer
 )
-from transformers.modeling_outputs import CausalLMOutputWithPast, ModelOutput
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from fastchat.train.train import (
     DataArguments,
@@ -36,15 +36,6 @@ PADDING_SIDE = 'right'
 model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
 
 @dataclass
-class TokenClassificationLMOutputWithPast(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    labels: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    
-@dataclass
 class LoraArguments:
     lora_r: int = 8
     lora_alpha: int = 16
@@ -59,14 +50,35 @@ class LoraArguments:
 
 # 定义 MoEPatternDataset 类
 class MoEPatternDataset(Dataset):
-    def __init__(self, data_file: str, training=False):
-        self.data_file = data_file
-        self.data = torch.load(data_file) # merged_data.pt
+    def __init__(self, data_path_or_file: str, training=False, num_evaluation=1000):
+        self.data_path_or_file = data_path_or_file
+        if isinstance(data_path_or_file, str) and data_path_or_file.endswith(".pt"):
+            self.data = torch.load(data_path_or_file) # merged_data.pt
+        else:
+            self.data = data_path_or_file
         self.training = training
         self.truncate_ratio = 1.
+        
+        # evaluate a part of data
+        self.num_evaluation = num_evaluation
+        if not self.training:
+            if num_evaluation == 1:
+                self.data = self.data[:num_evaluation]
+            else:
+                N = len(self.data)
+                step = (N - 1) / (num_evaluation - 1)
+                indices = np.round(np.arange(0, N - 1, step)).astype(int)
+                if len(indices) < num_evaluation:  # 确保返回K个样本，特别是当N非常接近K时
+                    indices = np.append(indices, N-1)
+                self.data = [self.data[i] for i in indices]
 
     def __len__(self):
-        return len(self.data)
+        if self.training:
+            return len(self.data)
+            # return 100 # for debug
+        else:
+            return self.num_evaluation
+            # return 100 # for debug
     
     def __getitem__(self, idx):
         if self.training:
@@ -171,25 +183,59 @@ def new_forward(
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return TokenClassificationLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            labels=labels,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
 
-def compute_metrics(outputs):
-    true_labels = outputs.labels
-    pred_labels = outputs.logits
-    true_indices = torch.nonzero(true_labels)[:,-1].view(true_labels.size(0), -1, 2)
-    pred_indices = pred_labels.topk(2)[1].sort()[0]
-    mask = (pred_indices == true_indices)
-    acc = mask.sum() / true_indices.numel()
+
+def acc_precision_recall_f1(y_true, y_pred):
+    # 真正例 (True Positives)
+    TP = np.sum((y_true == 1) & (y_pred == 1))
+    
+    # 假正例 (False Positives)
+    FP = np.sum((y_true == 0) & (y_pred == 1))
+    
+    # 假负例 (False Negatives)
+    FN = np.sum((y_true == 1) & (y_pred == 0))
+    
+    # 真负例 (True Negatives)
+    TN = np.sum((y_true == 0) & (y_pred == 0))
+    
+    # 准确率
+    accuracy = (TP + TN) / (TP + FP + FN + TN)
+    recall = TP / (TP + FN) if (TP + FN) != 0 else 0
+    precision = TP / (TP + FP) if (TP + FP) != 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) != 0 else 0
+    
     return {
-        'accuracy': acc
+        'accuracy': accuracy,
+        'recall': recall,
+        'precision': precision,
+        'f1': f1,
     }
+
+
+def compute_metrics(outputs):    
+    true_labels = outputs.label_ids
+    pred_labels = outputs.predictions
+    bs, seq_len, dim = pred_labels.shape
+    assert dim == NUM_LABELS, "Dimension of predictions should be {} but got {}".format(NUM_LABELS, dim)
+    true_labels = true_labels.reshape(-1, num_experts_per_layer)
+    pred_labels = pred_labels.reshape(-1, num_experts_per_layer)
+        
+    # Convert predictions to top-2 one-hot encoding
+    preds_one_hot = np.zeros_like(pred_labels)
+    top2_indices = np.argsort(pred_labels, axis=1)[:, -2:]
+    rows = np.arange(pred_labels.shape[0])[:, None]
+    preds_one_hot[rows, top2_indices] = 1
+
+    return acc_precision_recall_f1(
+        true_labels, preds_one_hot
+    )
 
 
 def train():
@@ -261,8 +307,9 @@ def train():
     # 实例化 MoEPatternDataset
     ################################
     print('loading MoEPatternDataset')
-    train_dataset = MoEPatternDataset('./merged_data.pt', training=True)
-    eval_dataset = MoEPatternDataset('./merged_data.pt', training=False)
+    origin_data = torch.load('./merged_data.pt')
+    train_dataset = MoEPatternDataset(origin_data, training=True)
+    eval_dataset = MoEPatternDataset(origin_data, training=False)
 
     trainer = Trainer(
         model=model,
@@ -274,6 +321,7 @@ def train():
         compute_metrics=compute_metrics,
     )
     model.config.use_cache = False
+    print('Start training')
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
