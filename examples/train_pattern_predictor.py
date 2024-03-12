@@ -41,7 +41,15 @@ class LoraArguments:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_target_modules: typing.List[str] = field(
-        default_factory=lambda: ["q_proj", "v_proj"]
+        default_factory=lambda: [
+            "q_proj",
+            "v_proj",
+            "k_proj",
+            "o_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj",
+        ]
     )
     lora_weight_path: str = ""
     lora_bias: str = "none"
@@ -74,23 +82,26 @@ class MoEPatternDataset(Dataset):
 
     def __len__(self):
         if self.training:
-            return len(self.data)
-            # return 100 # for debug
+            # return len(self.data)
+            return 2000 # for debug
         else:
             return self.num_evaluation
-            # return 100 # for debug
+            # return 50 # for debug
     
     def __getitem__(self, idx):
-        if self.training:
-            self.truncate_ratio = random.uniform(0.1, 1)
         seq_data = self.data[idx]
         input_ids = np.array(seq_data['data'])[:,0] # 第 idx 个数据的 token indices, (seq_len,)
         seq_len = len(input_ids)
         labels = np.stack(np.array(seq_data['data'])[:,1]).reshape(seq_len, -1) # 第 idx 个数据所有 token 的 pattern matrix, (seq_len, L*E)
         attention_mask = torch.ones(len(input_ids)) # (seq_len,)
         
-        truncate_length = int(seq_len * self.truncate_ratio)
-        start_index = random.randint(0, seq_len - truncate_length)
+        if self.training:
+            self.truncate_ratio = random.uniform(0.3, 1)
+            truncate_length = min(int(seq_len * self.truncate_ratio), 512)
+            # start_index = random.randint(0, seq_len - truncate_length)
+        else:
+            truncate_length = min(int(seq_len * self.truncate_ratio), 256)
+        start_index = 0
         end_index = start_index + truncate_length
         return {
             'input_ids': input_ids[start_index:end_index],
@@ -170,12 +181,15 @@ def new_forward(
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        logits = logits.float()
+        logits = []
+        for i in range(len(self.lm_head)):
+            logits_per_expert = self.lm_head[i](hidden_states).float() # (bs, seq_len, num_experts)
+            logits.append(logits_per_expert)
+        logits = torch.stack(logits, dim=-2) # # (bs, seq_len, num_layers, num_experts)
 
         loss = None
         if labels is not None:
-            labels = labels.to(logits.device).float()
+            labels = labels.to(logits.device).float().view(logits.shape)
             loss_fct = nn.BCEWithLogitsLoss()
             loss = loss_fct(logits, labels)
 
@@ -205,12 +219,22 @@ def acc_precision_recall_f1(y_true, y_pred):
     # 真负例 (True Negatives)
     TN = np.sum((y_true == 0) & (y_pred == 0))
     
-    # 准确率
-    accuracy = (TP + TN) / (TP + FP + FN + TN)
-    recall = TP / (TP + FN) if (TP + FN) != 0 else 0
-    precision = TP / (TP + FP) if (TP + FP) != 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) != 0 else 0
+    y_true = y_true.reshape(-1, 256)
+    y_pred = y_pred.reshape(-1, 256)
+    print(f"origin y_true.shape={y_true.shape}")
+    indices = np.any(y_true, axis=-1)
+    y_true = y_true[indices]
+    y_pred = y_pred[indices]
+    print(f"filtered y_true.shape={y_true.shape}")
     
+    # 准确率
+    num_tokens = y_true.shape[0]
+    accuracy = TP / (num_tokens*64)
+    recall = 0
+    precision = 0
+    f1 = 0
+    print(f"non-padding ratio: {indices.sum()}/{len(indices)}={indices.sum()/len(indices)}\n")
+
     return {
         'accuracy': accuracy,
         'recall': recall,
@@ -222,7 +246,11 @@ def acc_precision_recall_f1(y_true, y_pred):
 def compute_metrics(outputs):    
     true_labels = outputs.label_ids
     pred_labels = outputs.predictions
-    bs, seq_len, dim = pred_labels.shape
+    if len(pred_labels.shape) == 3:
+        bs, seq_len, dim = pred_labels.shape
+    elif len(pred_labels.shape)==4:
+        bs, seq_len, num_layer, num_experts = pred_labels.shape
+        dim = num_layer * num_experts
     assert dim == NUM_LABELS, "Dimension of predictions should be {} but got {}".format(NUM_LABELS, dim)
     true_labels = true_labels.reshape(-1, num_experts_per_layer)
     pred_labels = pred_labels.reshape(-1, num_experts_per_layer)
@@ -256,20 +284,27 @@ def train():
         model_args.model_name_or_path
     )
     # # for debug
-    config.num_hidden_layers = 8
-    config.hidden_size = 1024
-    config.intermediate_size = 2048
-    model = AutoModelForCausalLM.from_config(config)
+    # config.num_hidden_layers = 8
+    # config.hidden_size = 1024
+    # config.intermediate_size = 2048
+    # model = AutoModelForCausalLM.from_config(config)
     ## for real training
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     "mistralai/Mistral-7B-Instruct-v0.2")
+    model = AutoModelForCausalLM.from_pretrained(
+        "mistralai/Mistral-7B-Instruct-v0.2",
+        cache_dir="/data/common/mixtral/")
+    model.model.layers = model.model.layers[:6]
     model.forward = types.MethodType(new_forward, model)
-    model.lm_head = nn.Linear(model.config.hidden_size, num_layers*num_experts_per_layer, bias=False)
+    model.lm_head = nn.ModuleList([
+        nn.Linear(model.config.hidden_size, 8, bias=False) for i in range(32)
+    ])
     
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        model_max_length=training_args.model_max_length,
+        model_max_length=256,
         padding_side=PADDING_SIDE,
+        truncation_side=PADDING_SIDE,
+        padding=True,
+        truncation=True
     )
     ## 方案 1：设置 pad_token
     tokenizer.pad_token = tokenizer.unk_token
@@ -293,7 +328,8 @@ def train():
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
-    model.lm_head.weight.requires_grad = True
+    for module in model.lm_head:
+        module.weight.requires_grad = True
     if training_args.local_rank == 0:
         model.print_trainable_parameters()
 
@@ -339,7 +375,7 @@ def test_dataset():
     tokenizer.pad_token = tokenizer.unk_token
     data_collator = PatternDataCollatorWithPadding(tokenizer=tokenizer)
     dataset = MoEPatternDataset('./merged_data.pt')
-    data_loader = DataLoader(dataset, batch_size=8, collate_fn=data_collator)
+    data_loader = DataLoader(dataset, batch_size=8, collate_fn=data_collator) 
     for idx, batch in enumerate(data_loader):
         if idx > 5:
             break
