@@ -46,9 +46,9 @@ class LoraArguments:
             "v_proj",
             "k_proj",
             "o_proj",
-            # "gate_proj",
-            # "up_proj",
-            # "down_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ]
     )
     lora_weight_path: str = ""
@@ -82,8 +82,8 @@ class MoEPatternDataset(Dataset):
 
     def __len__(self):
         if self.training:
-            # return len(self.data)
-            return 2000 # for debug
+            return len(self.data)
+            # return 4000 # for debug
         else:
             return self.num_evaluation
             # return 50 # for debug
@@ -97,10 +97,12 @@ class MoEPatternDataset(Dataset):
         
         if self.training:
             self.truncate_ratio = random.uniform(0.3, 1)
-            truncate_length = min(int(seq_len * self.truncate_ratio), 512)
+            truncate_length = int(seq_len * self.truncate_ratio)
+            # truncate_length = min(int(seq_len * self.truncate_ratio), 512)
             # start_index = random.randint(0, seq_len - truncate_length)
         else:
             truncate_length = min(int(seq_len * self.truncate_ratio), 256)
+            # start_index = 0
         start_index = 0
         end_index = start_index + truncate_length
         return {
@@ -189,9 +191,13 @@ def new_forward(
 
         loss = None
         if labels is not None:
-            labels = labels.to(logits.device).float().view(logits.shape)
-            loss_fct = nn.BCEWithLogitsLoss()
-            loss = loss_fct(logits, labels)
+            labels = labels.to(logits.device).float()
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits.view(-1, num_experts_per_layer),
+                labels.view(-1, num_experts_per_layer),
+                reduction='none')
+            loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
+            loss = loss[loss_mask].sum() / loss_mask.sum()
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -292,7 +298,7 @@ def train():
     model = AutoModelForCausalLM.from_pretrained(
         "mistralai/Mistral-7B-Instruct-v0.2",
         cache_dir="/data/common/mixtral/")
-    model.model.layers = model.model.layers[:6]
+    model.model.layers = model.model.layers[:8]
     model.forward = types.MethodType(new_forward, model)
     model.lm_head = nn.ModuleList([
         nn.Linear(model.config.hidden_size, 8, bias=False) for i in range(32)
@@ -307,7 +313,7 @@ def train():
         truncation=True
     )
     ## 方案 1：设置 pad_token
-    tokenizer.pad_token = tokenizer.unk_token
+    tokenizer.pad_token = tokenizer.eos_token
     # # 方案 2：设置 pad_token
     # # 确保tokenizer已经设置了pad_token，如果没有，我们添加一个
     # if tokenizer.pad_token is None:
@@ -318,20 +324,21 @@ def train():
     ################################
     # 定义 LoRA 配置
     ################################
-    lora_config = LoraConfig(
-        r=lora_args.lora_r,
-        lora_alpha=lora_args.lora_alpha,
-        target_modules=lora_args.lora_target_modules,
-        lora_dropout=lora_args.lora_dropout,
-        bias=lora_args.lora_bias,
-        inference_mode=lora_args.inference_mode,
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    for module in model.lm_head:
-        module.weight.requires_grad = True
-    if training_args.local_rank == 0:
-        model.print_trainable_parameters()
+    # lora_config = LoraConfig(
+    #     r=lora_args.lora_r,
+    #     lora_alpha=lora_args.lora_alpha,
+    #     target_modules=lora_args.lora_target_modules,
+    #     lora_dropout=lora_args.lora_dropout,
+    #     bias=lora_args.lora_bias,
+    #     inference_mode=lora_args.inference_mode,
+    #     task_type="CAUSAL_LM",
+    # )
+    # model = get_peft_model(model, lora_config)
+    # model.model.model.norm.weight.requires_grad = True
+    # for module in model.lm_head:
+    #     module.weight.requires_grad = True
+    # if training_args.local_rank == 0:
+    #     model.print_trainable_parameters()
 
     ################################
     # 实例化DataCollatorWithPadding
@@ -358,14 +365,17 @@ def train():
     )
     model.config.use_cache = False
     print('Start training')
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    output_dir = training_args.output_dir
+    if training_args.run_name:
+        output_dir += f'_{training_args.run_name}'
+    if list(pathlib.Path(output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
     if training_args.local_rank == 0:
-        # model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-        model.save_pretrained(training_args.output_dir)
+        # model.save_pretrained(output_dir, state_dict=state_dict)
+        model.save_pretrained(output_dir)
 
 def test_dataset():
     tokenizer = AutoTokenizer.from_pretrained(
