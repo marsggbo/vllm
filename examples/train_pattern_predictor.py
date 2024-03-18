@@ -58,7 +58,14 @@ class LoraArguments:
 
 # 定义 MoEPatternDataset 类
 class MoEPatternDataset(Dataset):
-    def __init__(self, data_path_or_file: str, training=False, num_evaluation=1000):
+    def __init__(
+        self,
+        data_path_or_file: str,
+        training=False,
+        num_evaluation=1000,
+        train_max_seq_size = 512,
+        eval_max_seq_size = 512,
+    ):
         self.data_path_or_file = data_path_or_file
         if isinstance(data_path_or_file, str) and data_path_or_file.endswith(".pt"):
             self.data = torch.load(data_path_or_file) # merged_data.pt
@@ -66,6 +73,8 @@ class MoEPatternDataset(Dataset):
             self.data = data_path_or_file
         self.training = training
         self.truncate_ratio = 1.
+        self.train_max_seq_size = train_max_seq_size
+        self.eval_max_seq_size = eval_max_seq_size
         
         # evaluate a part of data
         self.num_evaluation = num_evaluation
@@ -97,18 +106,23 @@ class MoEPatternDataset(Dataset):
         
         if self.training:
             self.truncate_ratio = random.uniform(0.3, 1)
-            truncate_length = int(seq_len * self.truncate_ratio)
-            # truncate_length = min(int(seq_len * self.truncate_ratio), 512)
-            # start_index = random.randint(0, seq_len - truncate_length)
+            if self.train_max_seq_size is not None:
+                truncate_length = min(int(seq_len * self.truncate_ratio), self.train_max_seq_size)
+            else:
+                truncate_length = int(seq_len * self.truncate_ratio)
+            start_index = random.randint(0, seq_len - truncate_length)
         else:
-            truncate_length = min(int(seq_len * self.truncate_ratio), 256)
-            # start_index = 0
-        start_index = 0
+            if self.eval_max_seq_size is not None:
+                truncate_length = min(int(seq_len * self.truncate_ratio), self.eval_max_seq_size)
+            else:
+                truncate_length = int(seq_len * self.truncate_ratio)
+            start_index = 0
+        # start_index = 0
         end_index = start_index + truncate_length
         return {
-            'input_ids': input_ids[start_index:end_index],
+            'input_ids': torch.from_numpy(input_ids.astype(int)[start_index:end_index]),
             'attention_mask': attention_mask[start_index:end_index],
-            'labels': labels[start_index:end_index]
+            'labels': torch.from_numpy(labels.astype(int)[start_index:end_index])
         }
 
 
@@ -367,7 +381,8 @@ def train():
     print('Start training')
     output_dir = training_args.output_dir
     if training_args.run_name:
-        output_dir += f'_{training_args.run_name}'
+        output_dir += f'{training_args.run_name}'
+        training_args.output_dir = output_dir
     if list(pathlib.Path(output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
