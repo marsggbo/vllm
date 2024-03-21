@@ -17,7 +17,9 @@ from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     DataCollatorWithPadding,
-    Trainer
+    Trainer,
+    AdamW,
+    get_linear_schedule_with_warmup
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -34,6 +36,42 @@ num_experts_per_layer = 8
 NUM_LABELS = num_layers * num_experts_per_layer
 PADDING_SIDE = 'right'
 model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
+
+def create_optimizer_and_scheduler(
+    model, num_training_steps, learning_rate_head=2e-4, learning_rate_base=2e-5, warmup_steps=5000):
+    # 分离 `lm_head` 的参数和其它参数
+    no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if "lm_head" not in n and not any(nd in n for nd in no_decay)],
+            "weight_decay": 1e-4,
+            "lr": learning_rate_base,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "lm_head" not in n and any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": learning_rate_base,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "lm_head" in n and not any(nd in n for nd in no_decay)],
+            "weight_decay": 5e-3,
+            "lr": learning_rate_head,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if "lm_head" in n and any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": learning_rate_head,
+        },
+    ]
+
+    optimizer = AdamW(optimizer_grouped_parameters)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=num_training_steps
+    )
+
+    return optimizer, scheduler
 
 @dataclass
 class LoraArguments:
@@ -65,37 +103,40 @@ class MoEPatternDataset(Dataset):
         num_evaluation=1000,
         train_max_seq_size = 512,
         eval_max_seq_size = 512,
+        data_type: int = 2, # 0: alpaca, 1: yizhong, 2: merge
     ):
         self.data_path_or_file = data_path_or_file
         if isinstance(data_path_or_file, str) and data_path_or_file.endswith(".pt"):
-            self.data = torch.load(data_path_or_file) # merged_data.pt
+            self.origin_data = torch.load(data_path_or_file) # merged_data.pt
         else:
-            self.data = data_path_or_file
+            self.origin_data = data_path_or_file
         self.training = training
         self.truncate_ratio = 1.
         self.train_max_seq_size = train_max_seq_size
         self.eval_max_seq_size = eval_max_seq_size
-        
-        # evaluate a part of data
-        self.num_evaluation = num_evaluation
-        if not self.training:
-            if num_evaluation == 1:
-                self.data = self.data[:num_evaluation]
-            else:
-                N = len(self.data)
-                step = (N - 1) / (num_evaluation - 1)
-                indices = np.round(np.arange(0, N - 1, step)).astype(int)
-                if len(indices) < num_evaluation:  # 确保返回K个样本，特别是当N非常接近K时
-                    indices = np.append(indices, N-1)
-                self.data = [self.data[i] for i in indices]
+
+        alpaca_data_indices = list(range(10000))
+        yizhong_data_indices = list(range(10000, 20000))
+        merged_data_indices = list(range(20000))
+        assert data_type in[0,1,2], "data_type should be 0, 1 or 2 (0: alpaca, 1: yizhong, 2: merge)"
+        self.data_type = data_type
+        if data_type == 0:
+            self.data_indices = alpaca_data_indices
+        elif data_type == 1:
+            self.data_indices = yizhong_data_indices
+        else:
+            self.data_indices = merged_data_indices
+
+        N = len(self.data_indices)
+        step = N // num_evaluation
+        self.eval_indices = range(0, N, step)
+        if self.training:
+            self.data = [self.origin_data[i] for i in self.data_indices if i not in self.eval_indices]
+        else:
+            self.data = [self.origin_data[i] for i in self.eval_indices]
 
     def __len__(self):
-        if self.training:
-            return len(self.data)
-            # return 4000 # for debug
-        else:
-            return self.num_evaluation
-            # return 50 # for debug
+        return len(self.data)
     
     def __getitem__(self, idx):
         seq_data = self.data[idx]
@@ -205,6 +246,7 @@ def new_forward(
 
         loss = None
         if labels is not None:
+            # masked BCE loss
             labels = labels.to(logits.device).float()
             loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 logits.view(-1, num_experts_per_layer),
@@ -212,6 +254,9 @@ def new_forward(
                 reduction='none')
             loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
             loss = loss[loss_mask].sum() / loss_mask.sum()
+            # BCE loss (not recommended)
+            # labels = labels.to(logits.device).float().view(logits.shape)
+            # loss = nn.BCEWithLogitsLoss()(logits, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -309,10 +354,11 @@ def train():
     # config.intermediate_size = 2048
     # model = AutoModelForCausalLM.from_config(config)
     ## for real training
+    predictor_num_layers = 1
     model = AutoModelForCausalLM.from_pretrained(
         "mistralai/Mistral-7B-Instruct-v0.2",
         cache_dir="/data/common/mixtral/")
-    model.model.layers = model.model.layers[:8]
+    model.model.layers = model.model.layers[:predictor_num_layers]
     model.forward = types.MethodType(new_forward, model)
     model.lm_head = nn.ModuleList([
         nn.Linear(model.config.hidden_size, 8, bias=False) for i in range(32)
@@ -368,6 +414,12 @@ def train():
     train_dataset = MoEPatternDataset(origin_data, training=True)
     eval_dataset = MoEPatternDataset(origin_data, training=False)
 
+    # decouple optimization of base and head modules
+    len_dataloader = len(train_dataset) / training_args.per_device_train_batch_size
+    optimizer, scheduler = create_optimizer_and_scheduler(model, training_args.num_train_epochs * len_dataloader)
+    print("#params:", sum([p.numel() for p in model.parameters()]))
+    print("trainable #params:", sum([p.numel() for p in model.parameters() if p.requires_grad]))
+
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -376,6 +428,7 @@ def train():
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        optimizers=(optimizer, scheduler)
     )
     model.config.use_cache = False
     print('Start training')
@@ -399,7 +452,7 @@ def test_dataset():
     )
     tokenizer.pad_token = tokenizer.unk_token
     data_collator = PatternDataCollatorWithPadding(tokenizer=tokenizer)
-    dataset = MoEPatternDataset('./merged_data.pt')
+    dataset = MoEPatternDataset('./merged_data.pt', data_type=1)
     data_loader = DataLoader(dataset, batch_size=8, collate_fn=data_collator) 
     for idx, batch in enumerate(data_loader):
         if idx > 5:
