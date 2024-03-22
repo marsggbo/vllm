@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from safetensors.torch import load_file
 
 import transformers
 from transformers import (
@@ -75,6 +76,7 @@ def create_optimizer_and_scheduler(
 
 @dataclass
 class LoraArguments:
+    use_lora: bool = field(default=False)
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
@@ -92,6 +94,15 @@ class LoraArguments:
     lora_weight_path: str = ""
     lora_bias: str = "none"
     inference_mode: bool = False
+
+@dataclass
+class CustomArguments:
+    eval_only: bool = field(default=False, metadata={"help": "Evaluation only"})
+    ckpt_path: str = field(default=None, metadata={"help": "The checkpoint path for evaluation"})
+    eval_max_seq_size: int = field(default=512, metadata={"help": "eval truncation size"})
+    train_max_seq_size: int = field(default=512, metadata={"help": "train truncation size"})
+    num_evaluation: int = field(default=1000, metadata={"help": "#samples for evaluation"})
+    data_type: int = field(default=2, metadata={"help": "data type. 0: alpaca, 1: yizhong, 2: merge"})
 
 
 # 定义 MoEPatternDataset 类
@@ -122,10 +133,13 @@ class MoEPatternDataset(Dataset):
         self.data_type = data_type
         if data_type == 0:
             self.data_indices = alpaca_data_indices
+            print('using alpaca')
         elif data_type == 1:
             self.data_indices = yizhong_data_indices
+            print('using load_dataset("yizhongw/self_instruct", "super_natural_instructions")')
         else:
             self.data_indices = merged_data_indices
+            print('using merged data of alpaca and yizhongw/self_instruct/super_natural_instructions')
 
         N = len(self.data_indices)
         step = N // num_evaluation
@@ -330,16 +344,16 @@ def compute_metrics(outputs):
         true_labels, preds_one_hot
     )
 
-
 def train():
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments, LoraArguments)
+        (ModelArguments, DataArguments, TrainingArguments, LoraArguments, CustomArguments)
     )
     (
         model_args,
         data_args,
         training_args,
         lora_args,
+        custom_args
     ) = parser.parse_args_into_dataclasses()
     
     ################################
@@ -354,7 +368,7 @@ def train():
     # config.intermediate_size = 2048
     # model = AutoModelForCausalLM.from_config(config)
     ## for real training
-    predictor_num_layers = 1
+    predictor_num_layers = 2
     model = AutoModelForCausalLM.from_pretrained(
         "mistralai/Mistral-7B-Instruct-v0.2",
         cache_dir="/data/common/mixtral/")
@@ -381,25 +395,32 @@ def train():
     # # 需要更新模型的词汇表大小
     # model.resize_token_embeddings(len(tokenizer))
     
-    ################################
+    ###############################
     # 定义 LoRA 配置
-    ################################
-    # lora_config = LoraConfig(
-    #     r=lora_args.lora_r,
-    #     lora_alpha=lora_args.lora_alpha,
-    #     target_modules=lora_args.lora_target_modules,
-    #     lora_dropout=lora_args.lora_dropout,
-    #     bias=lora_args.lora_bias,
-    #     inference_mode=lora_args.inference_mode,
-    #     task_type="CAUSAL_LM",
-    # )
-    # model = get_peft_model(model, lora_config)
-    # model.model.model.norm.weight.requires_grad = True
-    # for module in model.lm_head:
-    #     module.weight.requires_grad = True
-    # if training_args.local_rank == 0:
-    #     model.print_trainable_parameters()
+    ###############################
+    if lora_args.use_lora:
+        lora_config = LoraConfig(
+            r=lora_args.lora_r,
+            lora_alpha=lora_args.lora_alpha,
+            target_modules=lora_args.lora_target_modules,
+            lora_dropout=lora_args.lora_dropout,
+            bias=lora_args.lora_bias,
+            inference_mode=lora_args.inference_mode,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        model.model.model.norm.weight.requires_grad = True
+        for module in model.lm_head:
+            module.weight.requires_grad = True
+        if training_args.local_rank == 0:
+            model.print_trainable_parameters()
 
+    if custom_args.eval_only:
+        # Load the model weights
+        print('loading weights for evaluation')
+        loaded_weights = load_file(custom_args.ckpt_path)
+        model.load_state_dict(loaded_weights)
+    
     ################################
     # 实例化DataCollatorWithPadding
     ################################
@@ -411,8 +432,19 @@ def train():
     ################################
     print('loading MoEPatternDataset')
     origin_data = torch.load('./merged_data.pt')
-    train_dataset = MoEPatternDataset(origin_data, training=True)
-    eval_dataset = MoEPatternDataset(origin_data, training=False)
+    train_dataset = MoEPatternDataset(
+        origin_data,
+        training=True,
+        train_max_seq_size=custom_args.train_max_seq_size,
+        data_type=custom_args.data_type
+    )
+    eval_dataset = MoEPatternDataset(
+        origin_data,
+        training=False,
+        eval_max_seq_size=custom_args.eval_max_seq_size,
+        num_evaluation=custom_args.num_evaluation,
+        data_type=custom_args.data_type
+    )
 
     # decouple optimization of base and head modules
     len_dataloader = len(train_dataset) / training_args.per_device_train_batch_size
@@ -431,6 +463,12 @@ def train():
         optimizers=(optimizer, scheduler)
     )
     model.config.use_cache = False
+    if custom_args.eval_only:
+        print('Start evaluating')
+        results = trainer.evaluate()
+        print(results)
+        return results
+
     print('Start training')
     output_dir = training_args.output_dir
     if training_args.run_name:
