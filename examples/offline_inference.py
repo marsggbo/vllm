@@ -97,3 +97,5 @@ print(f"Total time elapsed: {_all:.4f}sec {avg:.4f}±{std:.4f} seconds")
 
 
 # EXPERT_TRACE=1 CUDA_VISIBLE_DEVICES=1,2 python examples/offline_inference.py # 实测可运行，但是更长的句子还未测试 
+
+# PATTERN_SORT=1 CUDA_VISIBLE_DEVICES=1 python examples/offline_inference.py # 开启 pattern sort

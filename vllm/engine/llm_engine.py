@@ -20,6 +20,8 @@ from vllm.sequence import (SamplerOutput, Sequence, SequenceGroup,
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                TokenizerGroup)
 from vllm.utils import Counter, set_cuda_visible_devices, get_ip, get_open_port, get_distributed_init_method
+import torch
+from vllm.core.pattern_scheuler import PatternScheduler
 
 if ray:
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -110,11 +112,21 @@ class LLMEngine:
         else:
             self._init_workers()
 
+        if os.environ.get("PATTERN_SORT", "0") == "1":
+            self.pattern_scheduler = PatternScheduler(
+                batch_size_for_predictor=128,
+                window_size=200,
+                queue_max_length=256,
+                gpu_memory_limit=-1,
+                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            )
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
         # Create the scheduler.
         self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        if os.environ.get("PATTERN_SORT", "0") == "1":
+            self.scheduler.pattern_scheduler = self.pattern_scheduler
 
         # Logging.
         self.last_logging_time = 0.0

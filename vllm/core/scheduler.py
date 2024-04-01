@@ -183,6 +183,11 @@ class Scheduler:
             # sequence groups are added to the front and the new sequence groups
             # are added to the back.
             leftover_waiting_sequences = deque()
+            if hasattr(self, 'pattern_scheduler'):
+                start_time = time.monotonic()
+                self.waiting = self.pattern_scheduler.schedule(self.waiting)
+                end_time = time.monotonic()
+                print(f"Pattern Scheduler took {end_time - start_time} seconds")
             while self.waiting:
                 seq_group = self.waiting[0]
                 waiting_seqs = seq_group.get_seqs(
