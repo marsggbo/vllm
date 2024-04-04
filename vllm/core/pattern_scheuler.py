@@ -221,7 +221,7 @@ class PatternScheduler:
         logits = outputs.logits
         top2_indices = logits.topk(2, dim=-1).indices
         top2_one_hot_pattern_predictions = torch.zeros_like(logits)
-        top2_one_hot_pattern_predictions.scatter_(1, top2_indices, 1)
+        top2_one_hot_pattern_predictions.scatter_(-1, top2_indices, 1)
         extended_attention_mask = attention_mask[:, :, None, None]
         masked_output = top2_one_hot_pattern_predictions * extended_attention_mask
         sequence_level_patterns = torch.sum(masked_output, dim=1)
@@ -264,8 +264,7 @@ class PatternScheduler:
         else:
             indices_to_search = np.arange(len(sequence_group_list))
 
-        # while len(searched_seq_indices) < len(sequence_group_list): # 把所有数据都完成调度排序
-        while len(scheduled_indices) < self.queue_max_length: # 只要完成一个 batch 的数据排序即可，效率更高
+        while len(scheduled_indices) < self.queue_max_length and len(searched_seq_indices) < len(sequence_group_list): # 只要完成一个 batch 的数据排序即可，效率更高
             # 限制搜索范围到滑动窗口内的句子
             mask = np.isin(indices_to_search, searched_seq_indices, invert=True) # 保持原本的相关顺序
             window_indices = indices_to_search[mask][:self.window_size]

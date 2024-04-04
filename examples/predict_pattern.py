@@ -211,13 +211,13 @@ def main():
             examples["sentence"], padding=True, return_tensors="pt", return_attention_mask=True)
 
     print('building dataset and dataloader')
-    dataset = prepare_dataset(2)
+    dataset = prepare_dataset(data_list=2, sort_by_len=True)
     tokenized_dataset = dataset.map(preprocess_function, batched=True)
     data_collator = CustomDataCollatorWithPadding(tokenizer=tokenizer)
     data_loader = DataLoader(
         tokenized_dataset,
         batch_size=training_args.per_device_eval_batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=data_collator
     )
 
@@ -238,7 +238,7 @@ def main():
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
         top2_indices = logits.topk(2, dim=-1).indices
         top2_one_hot_pattern_predictions = torch.zeros_like(logits)
-        top2_one_hot_pattern_predictions.scatter_(1, top2_indices, 1)
+        top2_one_hot_pattern_predictions.scatter_(-1, top2_indices, 1)
         extended_attention_mask = attention_mask[:, :, None, None]
         masked_output = top2_one_hot_pattern_predictions * extended_attention_mask
         sequence_level_patterns = torch.sum(masked_output, dim=1)
