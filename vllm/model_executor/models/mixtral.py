@@ -128,15 +128,12 @@ def all_gather_dict(local_dict):
 
 
 class MixtralMoE(nn.Module):
-    # for tracking the global id of this layer
     layer_count = 0
-    all_layer_expert_inputs_info = {}
 
     def __init__(
         self,
         config: MixtralConfig,
-        linear_method: Optional[LinearMethodBase] = None,
-        return_profile: bool = False,
+        linear_method: Optional[LinearMethodBase] = None
     ):
         super().__init__()
         self.config = config
@@ -167,11 +164,8 @@ class MixtralMoE(nn.Module):
                                      self.num_total_experts,
                                      bias=False,
                                      linear_method=None)
-        self.return_profile = return_profile
         self.layer_id = self.__class__.layer_count
         self.__class__.layer_count += 1
-        self.expert_inputs_info = {}
-        self.__class__.all_layer_expert_inputs_info.update({self.layer_id: {}})
 
     def forward_origin(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -189,15 +183,6 @@ class MixtralMoE(nn.Module):
         for expert_idx in self.expert_indicies:
             expert_layer = self.experts[expert_idx]
             expert_mask = (selected_experts == expert_idx)
-
-            if self.return_profile:
-                # profile token distributions
-                num_tokens = expert_mask.sum().item()
-                # 更新当前专家历史输入信息
-                if expert_idx not in self.expert_inputs_info:
-                    self.expert_inputs_info[expert_idx] = []
-                self.expert_inputs_info[expert_idx].append(num_tokens)
-
             if expert_mask.sum() == 0:
                 continue
             expert_weights = (routing_weights * expert_mask).sum(dim=-1,
@@ -210,16 +195,6 @@ class MixtralMoE(nn.Module):
             else:
                 final_hidden_states.add_(current_hidden_states)
 
-        if self.return_profile:
-            assert self.layer_id in self.__class__.all_layer_expert_inputs_info
-            self.__class__.all_layer_expert_inputs_info[self.layer_id].update(self.expert_inputs_info)
-            # 如果是最后一层，则计算所有层的专家输入统计信息
-            if self.layer_id == self.__class__.layer_count - 1:
-                gathered_dict = all_gather_dict(deepcopy(self.__class__.all_layer_expert_inputs_info))
-                # 将统计信息保存为 JSON 文件和 CSV 文件
-                with open(f"expert_input_statistics.json", 'w') as f:
-                    json.dump(gathered_dict, f, indent=4)
-
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             batch_size, sequence_length, hidden_dim)
 
@@ -229,10 +204,10 @@ class MixtralMoE(nn.Module):
 
         # 计算路由权重
         router_logits, _ = self.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float) # (num_tokens, num_experts)
 
         # 选择 TOP-K 专家
-        top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1) # (num_tokens, self.top_k)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
         # tracing expert choices for each token
@@ -247,61 +222,24 @@ class MixtralMoE(nn.Module):
                             self.token2experts[seq_idx][token_idx][self.layer_id] = []
                         self.token2experts[seq_idx][token_idx][self.layer_id].append(expert_indices)
         final_hidden_states = torch.zeros_like(hidden_states)
-        ep_size = len(self.expert_indicies)
-        world_size = dist.get_world_size()
-        num_tokens_all = len(hidden_states) * 2
-        num_tokens_per_ep_group = num_tokens_all // world_size
         for local_idx, expert_idx in enumerate(self.expert_indicies):
             expert_layer = self.experts[expert_idx]
-
-            #########################################
-            #  method 1: selectedd_experts
-            #########################################
-
-            # # Long-tailed
-            # selected_experts = torch.zeros_like(selected_experts) # (b,top_k)
-            # selected_experts[:, 0] = 1
-
-            # # uniform情况
-            # interval_per_expert = len(selected_experts) * 2 // (dist.get_world_size() * len(self.expert_indicies))
-            # selected_experts = torch.zeros_like(selected_experts)
-            # selected_experts -= 1
-            # selected_experts[:interval_per_expert, 0] *= (-1 * expert_idx)
-
-            # expert_mask = (selected_experts == expert_idx)
-
-
-            #########################################
-            #  method 2: expert_mask
-            #########################################
             # 正常情况
             expert_mask = (selected_experts == expert_idx)
             
-            # # 长尾情况
+            # # # 长尾情况
+            # num_tokens_all = len(hidden_states) * self.top_k
             # expert_mask = torch.zeros_like(selected_experts).bool()
-            # if ep_size == 1:
-            #     if self.rank in [0, 1]:
-            #         expert_mask[:, 0] = True
-            # else:
-            #     if self.rank == 0 and local_idx < self.top_k:
-            #         expert_mask[:, 0] = True
+            # num_tokens_per_ep_group = num_tokens_all // self.top_k
+            # if self.rank in list(range(self.top_k)):
+            #     expert_mask[:num_tokens_per_ep_group, 0] = True
 
-            # # uniform情况
+            # # # uniform情况
+            # num_tokens_all = len(hidden_states) * self.top_k
             # expert_mask = torch.zeros_like(selected_experts)
-            # if ep_size == 1:
-            #     expert_mask[:num_tokens_per_ep_group, 0] = 1
-            # else:
-            #     if local_idx == 0:
-            #         expert_mask[:num_tokens_per_ep_group, 0] = 1
-            # expert_mask = expert_mask.bool()
+            # num_tokens_per_ep_group = num_tokens_all // self.num_total_experts
+            # expert_mask[:num_tokens_per_ep_group, 0] = True
 
-            if self.return_profile:
-                # profile token distributions
-                num_tokens = expert_mask.sum().item()
-                # 更新当前专家历史输入信息
-                if expert_idx not in self.expert_inputs_info:
-                    self.expert_inputs_info[expert_idx] = []
-                self.expert_inputs_info[expert_idx].append(num_tokens)
             # 创建专家掩码并进行选择
             indices = torch.nonzero(expert_mask)
 
@@ -316,13 +254,6 @@ class MixtralMoE(nn.Module):
                 current_hidden_states.mul_(cur_weight)
                 final_hidden_states.index_add_(0, indices[:, 0], current_hidden_states)
 
-        if self.return_profile:
-            assert self.layer_id in self.__class__.all_layer_expert_inputs_info
-            self.__class__.all_layer_expert_inputs_info[self.layer_id].update(self.expert_inputs_info)
-            # 如果是最后一层，则计算所有层的专家输入统计信息
-            if self.layer_id == self.__class__.layer_count - 1:
-                gathered_dict = all_gather_dict(deepcopy(self.__class__.all_layer_expert_inputs_info))
-                self.__class__.gathered_dict = gathered_dict
         return tensor_model_parallel_all_reduce(final_hidden_states).view(
             batch_size, sequence_length, hidden_dim)
 
