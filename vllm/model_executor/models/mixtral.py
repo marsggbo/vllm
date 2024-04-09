@@ -240,6 +240,7 @@ class MixtralMoE(nn.Module):
             # num_tokens_per_ep_group = num_tokens_all // self.num_total_experts
             # expert_mask[:num_tokens_per_ep_group, 0] = True
 
+            expert_mask = expert_mask.bool()
             # 创建专家掩码并进行选择
             indices = torch.nonzero(expert_mask)
 
